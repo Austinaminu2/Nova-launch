@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, Env, Symbol};
+use soroban_sdk::{symbol_short, Address, Env};
 use crate::storage;
 use crate::types::Error;
 
@@ -27,6 +27,7 @@ pub fn burn(env: &Env, caller: Address, token_index: u32, amount: i128) -> Resul
     info.total_supply = new_supply;
     storage::set_token_info(env, token_index, &info);
     storage::increment_burn_count(env, token_index);
+    storage::add_total_burned(env, token_index, amount);
 
     emit_burn_event(env, token_index, &caller, amount, new_supply);
     Ok(())
@@ -68,6 +69,7 @@ pub fn admin_burn(
     info.total_supply = new_supply;
     storage::set_token_info(env, token_index, &info);
     storage::increment_burn_count(env, token_index);
+    storage::add_total_burned(env, token_index, amount);
 
     emit_admin_burn_event(env, token_index, &admin, &holder, amount, new_supply);
     Ok(())
@@ -130,6 +132,7 @@ pub fn batch_burn(
     info.total_supply = new_supply;
     storage::set_token_info(env, token_index, &info);
     storage::increment_burn_count(env, token_index);
+    storage::add_total_burned(env, token_index, total_burn);
 
     emit_batch_burn_event(env, token_index, &admin, burns.len(), total_burn, new_supply);
     Ok(())
@@ -155,23 +158,90 @@ fn validate_address(addr: &Address) -> Result<(), Error> {
     Ok(())
 }
 
+// ─────────────────────────────────────────────
+//  Event emission
+// ─────────────────────────────────────────────
+
+/// Emit burn event (v1)
+/// 
+/// **Schema Version**: 1
+/// **Event Name**: burn_v1
+/// 
+/// **Topics** (indexed):
+/// - Event name: "burn_v1"
+/// - token_index: u32 - The token index
+/// 
+/// **Payload** (non-indexed):
+/// - caller: Address - The address that burned tokens
+/// - amount: i128 - The amount burned
+/// - new_supply: i128 - The new total supply after burn
+/// 
+/// **Schema Stability**: This schema is immutable. Any changes require a new version.
 fn emit_burn_event(env: &Env, token_index: u32, caller: &Address, amount: i128, new_supply: i128) {
     env.events().publish(
-        (Symbol::new(env, "burn"), token_index),
+        (symbol_short!("burn_v1"), token_index),
         (caller.clone(), amount, new_supply),
     );
 }
 
 fn emit_admin_burn_event(env: &Env, token_index: u32, admin: &Address, holder: &Address, amount: i128, new_supply: i128) {
+/// Emit admin burn event (v1)
+/// 
+/// **Schema Version**: 1
+/// **Event Name**: adm_bn_v1
+/// 
+/// **Topics** (indexed):
+/// - Event name: "adm_bn_v1"
+/// - token_index: u32 - The token index
+/// 
+/// **Payload** (non-indexed):
+/// - admin: Address - The admin who initiated the burn
+/// - holder: Address - The address whose tokens were burned
+/// - amount: i128 - The amount burned
+/// - new_supply: i128 - The new total supply after burn
+/// 
+/// **Schema Stability**: This schema is immutable. Any changes require a new version.
+fn emit_admin_burn_event(
+    env: &Env,
+    token_index: u32,
+    admin: &Address,
+    holder: &Address,
+    amount: i128,
+    new_supply: i128,
+) {
     env.events().publish(
-        (Symbol::new(env, "admin_burn"), token_index),
+        (symbol_short!("adm_bn_v1"), token_index),
         (admin.clone(), holder.clone(), amount, new_supply),
     );
 }
 
 fn emit_batch_burn_event(env: &Env, token_index: u32, admin: &Address, count: u32, total_burned: i128, new_supply: i128) {
+/// Emit batch burn event (v1)
+/// 
+/// **Schema Version**: 1
+/// **Event Name**: bch_bn_v1
+/// 
+/// **Topics** (indexed):
+/// - Event name: "bch_bn_v1"
+/// - token_index: u32 - The token index
+/// 
+/// **Payload** (non-indexed):
+/// - admin: Address - The admin who initiated the batch burn
+/// - count: u32 - The number of burns in the batch
+/// - total_burned: i128 - The total amount burned across all burns
+/// - new_supply: i128 - The new total supply after batch burn
+/// 
+/// **Schema Stability**: This schema is immutable. Any changes require a new version.
+fn emit_batch_burn_event(
+    env: &Env,
+    token_index: u32,
+    admin: &Address,
+    count: u32,
+    total_burned: i128,
+    new_supply: i128,
+) {
     env.events().publish(
-        (Symbol::new(env, "batch_burn"), token_index),
+        (symbol_short!("bch_bn_v1"), token_index),
         (admin.clone(), count, total_burned, new_supply),
     );
 }
