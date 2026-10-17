@@ -83,3 +83,4 @@ deployment-mainnet.json
 test-artifacts/
 !frontend/docs/CONFIRM_DIALOG_FOCUS.md
 !backend/docs/OPENAPI_CONTRACT_TESTS.md
+!frontend/docs/DEPLOY_PROGRESS_STEPPER.md

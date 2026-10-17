@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { AppError, ConfirmationStep, ConfirmationStepResponse, DeploymentResult, DeploymentStatus, TokenDeployParams, TokenInfo, WalletState } from '../types';
+import type { AppError, ConfirmationStep, ConfirmationStepResponse, DeployIndexStatus, DeployProgressEvent, DeployStepId, DeploymentResult, DeploymentStatus, TokenDeployParams, TokenInfo, WalletState } from '../types';
 import { ErrorCode } from '../types';
 import { createError, ErrorHandler, getErrorMessage } from '../utils/errors';
 import {
@@ -13,7 +13,8 @@ import { TransactionHistoryStorage, transactionHistoryStorage } from '../service
 import { getDeploymentFeeBreakdown } from '../utils/feeCalculation';
 import { analytics, AnalyticsEvent } from '../services/analytics';
 import { useAnalytics } from './useAnalytics';
-import { getConfirmationStep } from '../services/deploymentStatusApi';
+import { getConfirmationStep, getDeploymentStatus } from '../services/deploymentStatusApi';
+import { useTransactionMonitor } from './useTransactionMonitor';
 import { DeploymentRecoveryStorage } from '../services/DeploymentRecoveryStorage';
 
 const STATUS_MESSAGES: Record<DeploymentStatus, string> = {
@@ -23,6 +24,10 @@ const STATUS_MESSAGES: Record<DeploymentStatus, string> = {
     success: 'Deployment complete.',
     error: 'Deployment failed.',
 };
+
+/** Backend indexing poll: every 2s for up to 60s, then report "delayed". */
+const INDEX_POLL_INTERVAL_MS = 2_000;
+const INDEX_POLL_TIMEOUT_MS = 60_000;
 
 interface UseTokenDeployOptions {
     maxRetries?: number;
@@ -46,6 +51,17 @@ export function useTokenDeploy(wallet: WalletState, options: UseTokenDeployOptio
     const pollingStartRef = useRef<number | null>(null);
     const pollingTxHashRef = useRef<string | null>(null);
 
+    // Deployment progress stepper state (build → sign → submit → confirm → index)
+    const [deployStep, setDeployStep] = useState<DeployStepId | null>(null);
+    const [failedStep, setFailedStep] = useState<DeployStepId | null>(null);
+    const [indexStatus, setIndexStatus] = useState<DeployIndexStatus>('idle');
+    const [txHash, setTxHash] = useState<string | null>(null);
+    // Mirrors deployStep synchronously so a catch block knows which step failed.
+    const deployStepRef = useRef<DeployStepId | null>(null);
+    const indexPollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const indexTxHashRef = useRef<string | null>(null);
+    const txMonitor = useTransactionMonitor();
+
     const stellarService = useMemo(() => new StellarService(network), [network]);
     const ipfsService = useMemo(() => new IPFSService(), []);
     const { trackTokenDeployed, trackTokenDeployFailed } = useAnalytics();
@@ -57,8 +73,76 @@ export function useTokenDeploy(wallet: WalletState, options: UseTokenDeployOptio
                 clearTimeout(pollingRef.current);
                 pollingRef.current = null;
             }
+            if (indexPollRef.current) {
+                clearTimeout(indexPollRef.current);
+                indexPollRef.current = null;
+            }
         };
     }, []);
+
+    function enterStep(step: DeployStepId) {
+        deployStepRef.current = step;
+        setDeployStep(step);
+    }
+
+    function handleDeployProgress(event: DeployProgressEvent) {
+        enterStep(event.step);
+        if (event.step === 'confirm' && event.txHash) {
+            setTxHash(event.txHash);
+            txMonitor.startMonitoring(event.txHash);
+        }
+    }
+
+    function stopIndexPolling() {
+        if (indexPollRef.current) {
+            clearTimeout(indexPollRef.current);
+            indexPollRef.current = null;
+        }
+        indexTxHashRef.current = null;
+    }
+
+    /** Polls the backend until the confirmed deployment has been indexed. */
+    function startIndexPolling(hash: string, net: 'testnet' | 'mainnet') {
+        stopIndexPolling();
+        indexTxHashRef.current = hash;
+        setIndexStatus('pending');
+        const startedAt = Date.now();
+
+        const poll = async () => {
+            if (indexTxHashRef.current !== hash) return;
+            try {
+                const result = await getDeploymentStatus(hash, net);
+                if (indexTxHashRef.current !== hash) return;
+                if (result.status === 'CONFIRMED') {
+                    setIndexStatus('indexed');
+                    stopIndexPolling();
+                    return;
+                }
+            } catch {
+                // Transient backend errors: keep polling until the timeout.
+            }
+            if (indexTxHashRef.current !== hash) return;
+            if (Date.now() - startedAt >= INDEX_POLL_TIMEOUT_MS) {
+                // The token is live on-chain; indexing is only late, not failed.
+                setIndexStatus('delayed');
+                stopIndexPolling();
+                return;
+            }
+            indexPollRef.current = setTimeout(poll, INDEX_POLL_INTERVAL_MS);
+        };
+
+        void poll();
+    }
+
+    function resetProgress() {
+        stopIndexPolling();
+        txMonitor.stopMonitoring();
+        deployStepRef.current = null;
+        setDeployStep(null);
+        setFailedStep(null);
+        setIndexStatus('idle');
+        setTxHash(null);
+    }
 
     function stopPolling() {
         if (pollingRef.current) {
@@ -138,6 +222,7 @@ export function useTokenDeploy(wallet: WalletState, options: UseTokenDeployOptio
 
     const deploy = async (params: TokenDeployParams): Promise<DeploymentResult> => {
         setError(null);
+        resetProgress();
         // Only reset status if not already in a process or if it's a fresh start
         if (status !== 'uploading' && status !== 'deploying') {
             setStatus('idle');
@@ -224,6 +309,7 @@ export function useTokenDeploy(wallet: WalletState, options: UseTokenDeployOptio
                 });
                 const appError = createError(ErrorCode.IPFS_UPLOAD_FAILED, getErrorMessage(uploadError));
                 setError(appError);
+                setFailedStep('build');
                 setStatus('error');
                 try {
                     analytics.track(AnalyticsEvent.TOKEN_DEPLOY_FAILED, {
@@ -236,6 +322,7 @@ export function useTokenDeploy(wallet: WalletState, options: UseTokenDeployOptio
         }
 
         setStatus('deploying');
+        enterStep('build');
 
         // Check fee-bump availability for low-balance users (non-fatal)
         try {
@@ -277,12 +364,15 @@ export function useTokenDeploy(wallet: WalletState, options: UseTokenDeployOptio
         try {
             const feeBreakdown = getDeploymentFeeBreakdown(Boolean(metadataUri));
             const feePayment = BigInt(Math.round(feeBreakdown.totalFee * 10_000_000));
-            const serviceResult = await stellarService.deployToken({
-                ...params,
-                metadataUri,
-                creatorAddress: params.adminWallet,
-                feePayment,
-            });
+            const serviceResult = await stellarService.deployToken(
+                {
+                    ...params,
+                    metadataUri,
+                    creatorAddress: params.adminWallet,
+                    feePayment,
+                },
+                handleDeployProgress
+            );
             const result: DeploymentResult = {
                 tokenAddress: serviceResult.tokenAddress,
                 transactionHash: serviceResult.transactionHash,
@@ -302,6 +392,11 @@ export function useTokenDeploy(wallet: WalletState, options: UseTokenDeployOptio
 
             // Start progressive confirmation polling
             startPolling(serviceResult.transactionHash, network);
+
+            // Confirmed on-chain — move the stepper to indexing.
+            setTxHash(serviceResult.transactionHash);
+            enterStep('index');
+            startIndexPolling(serviceResult.transactionHash, network);
             
             try {
                 analytics.track(AnalyticsEvent.TOKEN_DEPLOYED, {
@@ -334,6 +429,7 @@ export function useTokenDeploy(wallet: WalletState, options: UseTokenDeployOptio
                 },
             });
             const appError = mapDeploymentError(deployError);
+            setFailedStep(deployStepRef.current ?? 'build');
             try {
                 analytics.track(AnalyticsEvent.TOKEN_DEPLOY_FAILED, {
                     network,
@@ -349,6 +445,7 @@ export function useTokenDeploy(wallet: WalletState, options: UseTokenDeployOptio
 
     const reset = () => {
         stopPolling();
+        resetProgress();
         setStatus('idle');
         setError(null);
         setRetryCount(0);
@@ -396,6 +493,14 @@ export function useTokenDeploy(wallet: WalletState, options: UseTokenDeployOptio
         feeBumpAvailable,
         confirmationStep,
         confirmations,
+        // Deployment progress stepper
+        deployStep,
+        failedStep,
+        indexStatus,
+        txHash,
+        // Only meaningful once this attempt has a submitted transaction.
+        monitorStatus: txHash ? txMonitor.status : null,
+        monitorProgress: txHash ? txMonitor.progress : undefined,
     };
 }
 

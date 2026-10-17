@@ -15,6 +15,7 @@ import type {
   AppError, 
   BurnTokenParams, 
   BurnResult,
+  DeployProgressEvent,
 } from '../types';
 import { ErrorCode } from '../types';
 import { FACTORY_METHODS } from '../contracts/factoryAbi';
@@ -370,10 +371,17 @@ export class StellarService {
     return args;
   }
 
+  /**
+   * @param onProgress Optional callback fired as the deployment moves through
+   *   build → sign → submit → confirm. `confirm` carries the transaction hash
+   *   so callers can start monitoring before this promise resolves.
+   */
   async deployToken(
-    params: TokenDeploymentParams
+    params: TokenDeploymentParams,
+    onProgress?: (event: DeployProgressEvent) => void
   ): Promise<TokenDeploymentResult> {
     try {
+      onProgress?.({ step: 'build' });
       const { creatorAddress, feePayment } = params;
       const sourceAccount = await this.server.getAccount(creatorAddress);
       const contract = new Contract(STELLAR_CONFIG.factoryContractId);
@@ -403,10 +411,13 @@ export class StellarService {
 
       const prepared = await this.server.prepareTransaction(tx);
       await this.simulateBeforeSigning(prepared as Transaction);
+      onProgress?.({ step: 'sign' });
       const signedXdr = await this.signWithWallet(prepared.toXDR());
       const signedTx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase) as Transaction;
 
+      onProgress?.({ step: 'submit' });
       const response = await this.server.sendTransaction(signedTx);
+      onProgress?.({ step: 'confirm', txHash: response.hash });
       const result = await this.waitForTransaction(response.hash);
 
       const tokenAddress = result.returnValue ? scValToNative(result.returnValue) : '';

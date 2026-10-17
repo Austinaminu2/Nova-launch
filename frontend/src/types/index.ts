@@ -118,6 +118,18 @@ export interface ConfirmationStepResponse {
   reason?: string;
 }
 
+// Deployment progress stepper (build → sign → submit → confirm → index)
+export type DeployStepId = 'build' | 'sign' | 'submit' | 'confirm' | 'index';
+
+export interface DeployProgressEvent {
+  step: DeployStepId;
+  /** Set once the transaction has been submitted (from the `confirm` step on). */
+  txHash?: string;
+}
+
+/** Backend indexing state for a confirmed deployment. */
+export type DeployIndexStatus = 'idle' | 'pending' | 'indexed' | 'delayed';
+
 // Burn Types
 export interface BurnTokenParams {
     tokenAddress: string;
